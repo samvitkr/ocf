@@ -4,8 +4,8 @@ Nx=640;
 Ny=512;
 Nz=192;
 
-kcond=64;
-tstart=406;
+kcond=90;
+tstart=300;
 tend=1024;
 step=2;
 
@@ -47,3 +47,11 @@ mf.density=density;
 mf.bandwidth=bandwidth;
 mf.ubin=ubin;
 mf.wbin=wbin;                                                                                                                                                         
+
+q2 = (ubin<0).*(wbin>0);
+q4 = (ubin>0).*(wbin<0);
+
+mf.uq2 = sum(ubin.*density.*q2,'all')/sum(density.*q2,'all');
+mf.wq2 = sum(wbin.*density.*q2,'all')/sum(density.*q2,'all');
+mf.uq4 = sum(ubin.*density.*q4,'all')/sum(density.*q4,'all');
+mf.wq4 = sum(wbin.*density.*q4,'all')/sum(density.*q4,'all');

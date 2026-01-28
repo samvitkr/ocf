@@ -10,30 +10,29 @@ import sys
 DATA_DIR = '/users/1/kuma0458/open_channel_ret180/data'
 CODE_DIR = '/users/1/kuma0458/open_channel_ret180/codes'
 DATA_FILENAME = 'filter_calc_input.mat'
-MODEL_FILENAME = 'siren_filter_model.pth'
+MODEL_FILENAME = 'siren_plateau_filter_model.pth'
 
 # ==========================================
-# 1. DATA LOADING (UPDATED FOR SOFT TARGETS)
+# 1. DATA LOADING (PLATEAU FILTER STRATEGY)
 # ==========================================
 def load_matlab_data():
     input_path = os.path.join(DATA_DIR, DATA_FILENAME)
     print(f"Loading data from {input_path}...")
     
     with h5py.File(input_path, 'r') as f:
-        # Load arrays and transpose to (Nz, Ny, Nx) or (N_points,)
+        # Load arrays and transpose to (Nz, Ny, Nx)
         Kxn = np.array(f['Kxn']).transpose()
         Kyn = np.array(f['Kyn']).transpose()
         Zn  = np.array(f['Zn']).transpose()
-        phin = np.array(f['phin']).transpose() # The Flux Data
+        phin = np.array(f['phin']).transpose() # Flux Data
         
         # Load Weights (W) if available, otherwise derive from phin
         if 'W' in f:
             W = np.array(f['W']).transpose()
         else:
-            # Fallback if W isn't in the .mat file
             W = np.abs(phin) 
 
-    # --- 1. Flatten Coordinates & Normalize to [-1, 1] ---
+    # --- Flatten & Normalize Coordinates ---
     coords_flat = np.stack([Kxn.flatten(), Kyn.flatten(), Zn.flatten()], axis=1)
     
     min_vals = coords_flat.min(axis=0)
@@ -42,31 +41,36 @@ def load_matlab_data():
     denom[denom == 0] = 1.0
     coords_flat = 2 * (coords_flat - min_vals) / denom - 1
 
-    # --- 2. CREATE SOFT TARGETS (0.0 to 1.0) ---
-    print("Generating Soft Regression Targets...")
+    # --- THE FIX: BINARY TARGETS + AMPLITUDE WEIGHTS ---
+    print("Generating Binary Targets for Integral Preservation...")
     
-    # Normalize flux magnitude to [0, 1] based on the global max
-    max_flux = np.max(np.abs(phin))
-    if max_flux == 0: max_flux = 1.0
-    norm_flux = phin.flatten() / max_flux
-
-    # Channel 0: Positive Lobe Intensity (0.0 -> 1.0)
-    # If flux is negative, this target is 0.0
-    target_pos = np.maximum(0, norm_flux)
+    # 1. BINARY TARGETS (0 or 1)
+    # This forces the model to predict 1.0 (max filter) whenever the sign is correct.
+    # It prevents the filter from dimming the signal in weak regions.
     
-    # Channel 1: Negative Lobe Intensity (0.0 -> 1.0)
-    # If flux is positive, this target is 0.0
-    target_neg = np.maximum(0, -norm_flux)
+    # Positive Filter Target: 1 if flux > 0, else 0
+    target_pos = (phin.flatten() > 0).astype(np.float32)
     
-    # Stack targets into shape (N, 2)
+    # Negative Filter Target: 1 if flux < 0, else 0
+    target_neg = (phin.flatten() < 0).astype(np.float32)
+    
     targets_flat = np.stack([target_pos, target_neg], axis=1)
 
-    # --- 3. WEIGHTS ---
-    # Since targets are soft (0 in background), we can use uniform weights of 1.0
-    # or boost the importance slightly. Let's use 1.0 to keep it stable.
-    weights_flat = np.ones(target_pos.shape[0], dtype=np.float32)
+    # 2. CONTINUOUS WEIGHTS (Softness Control)
+    # We use the normalized flux magnitude as the "importance".
+    # - High Flux: Weight ~ 1. Model MUST predict 1.0.
+    # - Low Flux: Weight ~ 0. Model is allowed to transition smoothly.
+    mag = np.abs(phin.flatten())
+    if mag.max() > 0:
+        weights_flat = mag / mag.max()
+    else:
+        weights_flat = mag
 
-    # Convert to Tensor
+    # Add a small floor (0.05) to ensure the background (Target 0) is actively suppressed
+    weights_flat = weights_flat + 0.05
+
+    print(f"Targets prepared. Positive Ratio: {target_pos.mean():.1%}, Negative Ratio: {target_neg.mean():.1%}")
+
     return (torch.tensor(coords_flat, dtype=torch.float32),
             torch.tensor(targets_flat, dtype=torch.float32),
             torch.tensor(weights_flat, dtype=torch.float32))
@@ -92,7 +96,7 @@ class SineLayer(nn.Module):
 class DualFilterSiren(nn.Module):
     def __init__(self):
         super().__init__()
-        # IMPORTANT: omega_0=1.0 forces smooth, large blobs (prevents high-freq noise)
+        # omega_0=1.0 ensures smooth, large-scale blobs (prevents high-freq noise)
         self.net = nn.Sequential(
             SineLayer(3, 256, is_first=True, omega_0=1.0),
             SineLayer(256, 256, is_first=False, omega_0=1.0),
@@ -109,30 +113,22 @@ def train_model():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running on: {device}")
 
-    # 1. Load Data (CPU)
+    # 1. Load Data
     coords, targets, weights = load_matlab_data()
-
-    # 2. Scale Weights (Optional, effectively uniform 10.0 here)
-    # Boosting weights slightly helps gradients flow better with BCEWithLogits
-    weights = weights * 10.0
     
-    print(f"Targets prepared. Shape: {targets.shape}. Max value: {targets.max()}")
-    print("Strategy: Soft Target Regression (Learning the exact flux intensity)")
-
-    # 3. MOVE EVERYTHING TO GPU
-    print("Moving dataset to GPU VRAM...")
+    # 2. Move to GPU
+    print("Moving dataset to GPU...")
     coords = coords.to(device)
     targets = targets.to(device)
     weights = weights.to(device)
-    print("Data loaded on GPU.")
 
     # Initialize Model
     model = DualFilterSiren().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
-    # Loss Function: BCEWithLogitsLoss
-    # Ideally suited for regression of probabilities (0.0 to 1.0)
-    # reduction='none' allows us to apply manual weights if needed later
+    # Loss: Binary Cross Entropy with Logits
+    # Suitable for binary targets (0/1) + sigmoid activation
+    # reduction='none' allows manual weighting per pixel
     criterion = nn.BCEWithLogitsLoss(reduction='none')
 
     # Batching Setup
@@ -140,8 +136,8 @@ def train_model():
     batch_size = 65536
     num_batches = int(np.ceil(N / batch_size))
     
-    epochs = 200 # 200 is plenty for this simplified task
-    print(f"Starting Training for {epochs} epochs...")
+    epochs = 200 # Sufficient for convergence
+    print(f"Starting Training (Integral Maximization Mode)...")
 
     model.train()
 
@@ -156,21 +152,20 @@ def train_model():
             end = min(start + batch_size, N)
             idx = indices[start:end]
 
-            # Fetch Batch (Already on GPU)
+            # Inputs (Already on GPU)
             batch_coords = coords[idx]
-            batch_targets = targets[idx]
-            batch_weights = weights[idx].unsqueeze(1) # Shape (Batch, 1) to broadcast
+            batch_targets = targets[idx]          # Binary (0 or 1)
+            batch_weights = weights[idx].unsqueeze(1) # Amplitude Weights
 
             optimizer.zero_grad()
             
             # Forward Pass
             logits = model(batch_coords)
             
-            # Loss Calculation
-            # We predict logits, compare against soft targets (0.0-1.0)
+            # Weighted Loss Calculation
+            # Forces model to 1.0 where Target=1 & Weight=High
+            # Forces model to 0.0 where Target=0 & Weight>0
             raw_loss = criterion(logits, batch_targets)
-            
-            # Apply weights (uniformly 10.0 in this setup, effectively a scalar)
             loss = (raw_loss * batch_weights).mean()
             
             loss.backward()
@@ -178,8 +173,7 @@ def train_model():
             
             epoch_loss += loss.item()
 
-        # Print Progress
-        if epoch % 5 == 0:
+        if epoch % 10 == 0:
             avg_loss = epoch_loss / num_batches
             print(f"Epoch {epoch} | Loss: {avg_loss:.6f}", flush=True)
 
@@ -189,7 +183,7 @@ def train_model():
         
     save_path = os.path.join(CODE_DIR, MODEL_FILENAME)
     torch.save(model.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
+    print(f" Model saved to {save_path}")
 
 if __name__ == "__main__":
     train_model()

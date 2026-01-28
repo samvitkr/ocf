@@ -38,7 +38,7 @@ pscm=psc1+psc2+psc3+psc4;
 pscm=real(pscm(1:Nx/2,1:Ny/2,:));
 phiwoym=pscm;
 
-m=matfile('spectra2d.mat','Writable',true)
+m=matfile('../data/spectra2d.mat','Writable',true)
 m.phivozm=phivozm;
 m.phiwoym=phiwoym;
 m.Kx =Kx;
